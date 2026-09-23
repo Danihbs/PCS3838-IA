@@ -82,7 +82,7 @@ CONFIG = {
     # --------------------------------------------------------------------------
     "count_cache_path": "/kaggle/working/count_cache_graph_v3.json",
     "simulation_cache_path": "/kaggle/working/simulation_cache_graph_v3.json",
-    "graph_cache_path": "/kaggle/working/graph_cache_v3.json",
+    "graph_cache_path": "/kaggle/working/graph_cache_v3_1.json",  # nova versão -> não reusa cache velho sem labels
     "output_csv_path": "/kaggle/working/submission.csv",
 
     "save_cache_every": 10,
@@ -135,36 +135,19 @@ GATE_EVAL_FUNCTIONS = {
 
 # ==============================================================================
 # 3. CONFIGURAÇÃO DE VISÃO COMPUTACIONAL
-#
-# Calibrado e validado manualmente contra uma imagem real de 13 portas
-# (3 AND, 3 NOT, 2 NOR, 3 OR, 2 XOR) — classificação E topologia de
-# conexões bateram 100%. Ainda assim, RODE debug_visualize_extraction()
-# em imagens do SEU dataset antes de confiar cegamente: fontes de label,
-# espessura de traço e estilo de "degrau" do fio podem variar.
 # ==============================================================================
 
 CONFIG_CV = {
     "use_otsu": True,
     "binary_threshold": 127,
 
-    # Buracos candidatos a corpo de porta. Buracos de dígitos de texto
-    # (labels x0, x1, Q, ...) tendem a ficar bem abaixo disso; corpos de
-    # porta, bem acima. Se seu dataset tiver fontes de label muito grandes,
-    # aumente esse valor até separar bem os dois grupos (use o script de
-    # calibração no final deste arquivo, seção 7-debug).
     "gate_hole_min_area": 3000,
     "max_gate_area_fraction": 0.15,
 
-    # NOT: triângulo — proporção altura/largura do bbox do buraco interno.
     "not_hw_ratio_min": 1.15,
 
-    # Fração de preenchimento (área do buraco / área do bbox) separa
-    # AND-family (D-shape, quase retangular) de OR-family (a curva de
-    # entrada reduz a área).
     "and_fill_fraction_min": 0.85,
 
-    # Bolha de inversão: buraco pequeno, quase circular, colado à borda
-    # direita (saída) de um gate.
     "bubble_min_area": 350,
     "bubble_max_area": 950,
     "bubble_circularity_min": 0.80,
@@ -172,23 +155,35 @@ CONFIG_CV = {
     "bubble_aspect_max": 1.55,
     "bubble_snap_distance": 22,
 
-    # XOR/XNOR: curva extra de entrada, buscada varrendo linhas horizontais
-    # perto do centro vertical do gate, à esquerda do seu bbox.
     "xor_strip_width": 45,
     "xor_strip_margin": 5,
     "xor_rows_to_sample": 7,
     "xor_rows_span": 12,
     "xor_min_positive_rows": 4,
 
-    # Rastreamento de fio.
     "wire_dilate_kernel": 3,
-    # Margem local de apagamento de cada porta (não confundir com o
-    # parent_contour de tinta, que fica fundido a toda a rede de fios).
     "gate_erase_margin": 8,
-    # Raio de busca para casar pontas de fio com portas. PRECISA ser >= à
-    # maior margem de apagamento usada (XOR usa margin + 25 à esquerda),
-    # senão a ponta sobrevivente fica fora de alcance.
     "terminal_snap_radius": 45,
+
+    # --------------------------------------------------------------------------
+    # NOVO em v3.1 — OCR de labels externas (x0, x1, ..., Q)
+    # --------------------------------------------------------------------------
+    # Blob de caractere isolado ("x", "7", "1", "Q", ...) — bem menor
+    # que o buraco interno de uma porta, então não conflita com
+    # gate_hole_min_area.
+    "label_char_max_area": 2500,
+    # Distância máxima (px) entre blobs do MESMO texto para agrupá-los
+    # numa única label (ex.: "x" e "7" separados viram "x7").
+    "label_cluster_distance": 18,
+    # Margem ao recortar o crop antes do OCR.
+    "label_ocr_padding": 6,
+    # Fator de upscale do crop — fonte pequena de label se beneficia
+    # muito de upscale antes do tesseract.
+    "label_ocr_upscale": 3,
+    # Distância máxima (px) entre a ponta de fio solta (entrada externa)
+    # e a label OCR'd mais próxima para aceitar o casamento. Acima
+    # disso, cai no fallback de nome sequencial x{order}.
+    "label_match_max_distance": 60,
 }
 
 
@@ -257,10 +252,6 @@ def _bbox_distance(bbox_a, bbox_b):
 
 
 def _find_gate_holes(binary_image):
-    """Retorna lista de (hole_contour, parent_index) para buracos grandes
-    o suficiente para ser corpo de porta (RETR_CCOMP + hierarquia, não
-    RETR_EXTERNAL — ver explicação no topo do arquivo)."""
-
     contours, hierarchy = cv2.findContours(
         binary_image, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE,
     )
@@ -278,7 +269,7 @@ def _find_gate_holes(binary_image):
         parent = hierarchy[index][3]
 
         if parent == -1:
-            continue  # não é um buraco, é um contorno de tinta externo
+            continue
 
         area = cv2.contourArea(contour)
 
@@ -289,9 +280,6 @@ def _find_gate_holes(binary_image):
 
 
 def _find_small_holes(binary_image):
-    """Candidatos a bolha de inversão (podem incluir buracos de texto —
-    filtrados depois por proximidade a um gate)."""
-
     contours, hierarchy = cv2.findContours(
         binary_image, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE,
     )
@@ -422,15 +410,179 @@ def detect_gates(image_bgr):
 
 
 # ==============================================================================
+# 4b. OCR DE LABELS EXTERNAS (x0, x1, ..., Q)   —  NOVO em v3.1
+#
+# Cada caractere de label ("x", "7", "Q", ...) é desenhado como um blob
+# de TINTA isolado (contorno externo, sem pai na hierarquia) que não
+# toca nenhuma porta nem fio. Agrupamos blobs próximos (ex.: "x" + "7")
+# numa única label e rodamos OCR em cada grupo.
+#
+# Requer: pip install pytesseract  (+ pacote de sistema tesseract-ocr).
+# Se tesseract não estiver disponível, extract_io_labels() retorna []
+# e o pipeline cai de volta no nome sequencial x{order} (comportamento
+# da v3) — degrada, não quebra.
+# ==============================================================================
+
+try:
+    import pytesseract
+    _HAS_TESSERACT = True
+except ImportError:
+    _HAS_TESSERACT = False
+
+
+def _find_label_char_blobs(binary_image, gates):
+    """Contornos de TINTA (sem pai) pequenos o suficiente pra ser um
+    caractere de label, e que não colam no bbox de nenhuma porta."""
+
+    contours, hierarchy = cv2.findContours(
+        binary_image, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    if hierarchy is None:
+        return []
+
+    hierarchy = hierarchy[0]
+    gate_boxes = [gate.hole_bbox for gate in gates]
+    blobs = []
+
+    for index, contour in enumerate(contours):
+        parent = hierarchy[index][3]
+
+        if parent != -1:
+            continue  # é um buraco (já tratado em _find_gate_holes/_find_small_holes)
+
+        area = cv2.contourArea(contour)
+
+        if area <= 0 or area > CONFIG_CV["label_char_max_area"]:
+            continue
+
+        x, y, w, h = cv2.boundingRect(contour)
+
+        too_close_to_gate = any(
+            _bbox_distance((x, y, w, h), gate_box) < 4
+            for gate_box in gate_boxes
+        )
+
+        if too_close_to_gate:
+            continue
+
+        blobs.append((x, y, w, h))
+
+    return blobs
+
+
+def _cluster_label_blobs(blobs, max_distance):
+    """Agrupa blobs de caractere próximos (ex.: 'x' + '7') numa única
+    label, via componentes conexos num grafo de adjacência por distância."""
+
+    n = len(blobs)
+
+    if n == 0:
+        return []
+
+    adjacency = nx.Graph()
+    adjacency.add_nodes_from(range(n))
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _bbox_distance(blobs[i], blobs[j]) <= max_distance:
+                adjacency.add_edge(i, j)
+
+    clusters = []
+
+    for component in nx.connected_components(adjacency):
+        x0 = min(blobs[i][0] for i in component)
+        y0 = min(blobs[i][1] for i in component)
+        x1 = max(blobs[i][0] + blobs[i][2] for i in component)
+        y1 = max(blobs[i][1] + blobs[i][3] for i in component)
+        clusters.append((x0, y0, x1 - x0, y1 - y0))
+
+    return clusters
+
+
+def _normalize_label_text(raw_text):
+    """'x7' -> 'x7'; '7' (OCR engoliu o 'x') -> 'x7'; 'Q' -> 'Q';
+    ilegível -> None."""
+
+    cleaned = re.sub(r"[^A-Za-z0-9]", "", str(raw_text)).strip()
+
+    if not cleaned:
+        return None
+
+    if cleaned.upper() == "Q":
+        return "Q"
+
+    if cleaned.isdigit():
+        return f"x{cleaned}"
+
+    match = re.fullmatch(r"[xX](\d+)", cleaned)
+
+    if match:
+        return f"x{match.group(1)}"
+
+    return None
+
+
+def _ocr_read_crop(gray_image, bbox):
+    x, y, w, h = bbox
+    padding = CONFIG_CV["label_ocr_padding"]
+
+    x0 = max(0, x - padding)
+    y0 = max(0, y - padding)
+    x1 = min(gray_image.shape[1], x + w + padding)
+    y1 = min(gray_image.shape[0], y + h + padding)
+
+    crop = gray_image[y0:y1, x0:x1]
+
+    if crop.size == 0:
+        return None
+
+    scale = CONFIG_CV["label_ocr_upscale"]
+    crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    _, crop_binary = cv2.threshold(crop, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    raw_text = pytesseract.image_to_string(
+        crop_binary,
+        config="--psm 8 -c tessedit_char_whitelist=xQ0123456789",
+    )
+
+    return _normalize_label_text(raw_text)
+
+
+def extract_io_labels(image_bgr, gates):
+    """Retorna lista de (label_text, (center_x, center_y)) para toda
+    label 'xN' / 'Q' encontrada na imagem. Lista simples (não dict!) —
+    ver seção 5 para por que isso importa quando um gate tem 2+ entradas
+    externas."""
+
+    if not _HAS_TESSERACT:
+        return []
+
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    binary = _binarize(gray)
+
+    blobs = _find_label_char_blobs(binary, gates)
+    clusters = _cluster_label_blobs(blobs, CONFIG_CV["label_cluster_distance"])
+
+    labels = []
+
+    for bbox in clusters:
+        text = _ocr_read_crop(gray, bbox)
+
+        if text is None:
+            continue
+
+        x, y, w, h = bbox
+        labels.append((text, (x + w / 2.0, y + h / 2.0)))
+
+    return labels
+
+
+# ==============================================================================
 # 5. RASTREAMENTO DE FIOS (via pontas de esqueleto cortadas)
 # ==============================================================================
 
 def _mask_out_gate_bodies(binary_image, gates):
-    """Apaga só a REGIÃO LOCAL de cada porta (bbox do buraco + margem
-    pequena). Não usamos parent_contour: fio e porta são o mesmo
-    componente de tinta conectado nesse dataset (sem espaço entre eles),
-    então apagar o parent_contour apagaria a rede de fios inteira."""
-
     wires_only = binary_image.copy()
     height, width = binary_image.shape[:2]
     margin = CONFIG_CV["gate_erase_margin"]
@@ -482,9 +634,6 @@ def _skeleton_components(binary_wires):
 
 
 def _find_skeleton_endpoints(coords_set):
-    """Pixels do esqueleto com exatamente 1 vizinho — pontas de fio
-    soltas (cotos deixados pela apagação das portas)."""
-
     neighbor_offsets = [
         (-1, -1), (0, -1), (1, -1),
         (-1, 0), (1, 0),
@@ -512,7 +661,10 @@ def _find_skeleton_endpoints(coords_set):
 def _assign_endpoints_to_gates(endpoints, gates, max_distance):
     """Associa cada ponta de fio solta ao gate mais próximo, marcando o
     lado (ENTRADA = esquerda do gate, SAÍDA = direita do gate). Retorna
-    dict: gate_index -> {'input': [pixels], 'output': [pixels]}."""
+    dict: gate_index -> {'input': [pixels], 'output': [pixels]}. Isto
+    JÁ é uma lista por lado (não um valor único), então não há perda
+    aqui — o bug do dict-por-gate estava na etapa SEGUINTE (casamento
+    com OCR), não nesta função."""
 
     assignment = {i: {"input": [], "output": []} for i in range(len(gates))}
 
@@ -571,6 +723,11 @@ def build_circuit_graph(image_bgr, gates):
 
     # Duas pontas de fio no MESMO componente conexo do esqueleto são as
     # duas extremidades do mesmo fio físico -> conecta saída -> entrada.
+    # Registramos os pixels de ENTRADA "consumidos" nessa etapa para,
+    # depois, sabermos exatamente quais pontas de entrada SOBRARAM soltas
+    # (== entradas externas reais do circuito, candidatas a OCR).
+    consumed_input_pixels = set()
+
     for source_index in range(len(gates)):
         output_pixels = endpoint_assignment[source_index]["output"]
 
@@ -585,27 +742,76 @@ def build_circuit_graph(image_bgr, gates):
                 continue
 
             for px in endpoint_assignment[target_index]["input"]:
+                if px in consumed_input_pixels:
+                    continue
+
                 if components.get(px) in source_components:
                     circuit_graph.add_edge(f"gate_{source_index}", f"gate_{target_index}")
+                    consumed_input_pixels.add(px)
                     break
 
-    # Entradas/pinos sem par (fio saindo pra fora do circuito) viram
-    # entradas externas nomeadas x0, x1, ... por ordem vertical.
-    unresolved_input_slots = []
+    # ------------------------------------------------------------------------
+    # Entradas externas — NOVO em v3.1: nomeadas por OCR, não por ordem.
+    #
+    # Cada ponta de fio de ENTRADA que não foi consumida acima é um SLOT
+    # de entrada externa por si só (não um "gate"): guardamos o PIXEL,
+    # não só o índice do gate, porque um mesmo gate pode ter 2+ entradas
+    # externas (ex.: AND alimentado por x1 e x9) e cada uma precisa casar
+    # com a SUA PRÓPRIA label, independentemente da outra.
+    # ------------------------------------------------------------------------
+    unresolved_input_slots = []  # lista de (gate_index, (px, py)) — 1 item por slot
 
     for gate_index, gate in enumerate(gates):
-        n_predecessors = circuit_graph.in_degree(f"gate_{gate_index}")
-        n_expected_inputs = len(gate.input_points)
-        missing = n_expected_inputs - n_predecessors
+        for px in endpoint_assignment[gate_index]["input"]:
+            if px not in consumed_input_pixels:
+                unresolved_input_slots.append((gate_index, px))
 
-        for _ in range(max(0, missing)):
-            unresolved_input_slots.append((gate_index, gate.hole_bbox[1]))
+    # Ordena por posição vertical só como critério estável de desempate
+    # para o fallback sequencial (quando o OCR falha); o nome real,
+    # quando disponível, vem do OCR abaixo.
+    unresolved_input_slots.sort(key=lambda item: item[1][1])
 
-    unresolved_input_slots.sort(key=lambda item: item[1])
+    ocr_labels = [
+        (text, position) for text, position in extract_io_labels(image_bgr, gates)
+        if text != "Q"
+    ]
 
-    for order, (gate_index, _y) in enumerate(unresolved_input_slots):
-        input_name = f"x{order}"
-        circuit_graph.add_node(input_name, kind="input")
+    # Casamento 1:1, SLOT a SLOT — uma lista simples alinhada em índice
+    # com unresolved_input_slots, NÃO um dict indexado por gate_index.
+    # É exatamente essa troca (lista vs. dict-por-gate) que evita o bug:
+    # antes, a segunda entrada externa de um gate sobrescrevia a primeira
+    # no dict e um OCR correto era descartado em silêncio. Aqui cada slot
+    # busca sua própria label mais próxima, independentemente das outras
+    # — inclusive permitindo que a MESMA label case com mais de um slot,
+    # o que é correto em caso de fan-out (um fio alimentando 2 portas).
+    max_label_distance = CONFIG_CV["label_match_max_distance"]
+    matched_labels = []
+
+    for (_gate_index, (px, py)) in unresolved_input_slots:
+        best_text = None
+        best_distance = max_label_distance
+
+        for text, (lx, ly) in ocr_labels:
+            distance = ((px - lx) ** 2 + (py - ly) ** 2) ** 0.5
+
+            if distance < best_distance:
+                best_distance = distance
+                best_text = text
+
+        matched_labels.append(best_text)
+
+    input_nodes_created = set()
+
+    for order, (gate_index, _px) in enumerate(unresolved_input_slots):
+        label_text = matched_labels[order]
+        # fallback: sem OCR disponível ou sem casamento dentro do raio
+        # -> mantém o comportamento antigo da v3 em vez de quebrar.
+        input_name = label_text if label_text is not None else f"x{order}"
+
+        if input_name not in input_nodes_created:
+            circuit_graph.add_node(input_name, kind="input")
+            input_nodes_created.add(input_name)
+
         circuit_graph.add_edge(input_name, f"gate_{gate_index}")
 
     sink_candidates = [
@@ -715,9 +921,12 @@ def debug_visualize_extraction(image_path, save_path=None):
             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA,
         )
 
+    input_nodes = [n for n in circuit_graph.nodes if circuit_graph.nodes[n].get("kind") == "input"]
+
     print(f"Portas detectadas: {len(gates)}")
     print("Contagem por tipo:", dict(Counter(g.gate_type for g in gates)))
     print(f"Grafo válido: {is_valid} ({reason})")
+    print("Entradas externas nomeadas (OCR ou fallback):", sorted(input_nodes))
     print("Arestas:", sorted(circuit_graph.edges))
 
     if save_path:
@@ -725,6 +934,28 @@ def debug_visualize_extraction(image_path, save_path=None):
         print(f"Overlay salvo em: {save_path}")
 
     return overlay, gates, circuit_graph, is_valid, reason
+
+
+def debug_check_ocr_labels(image_path):
+    """Roda só a extração de labels (sem o resto do pipeline) para
+    conferir manualmente se o OCR está lendo x0..xN e Q corretamente
+    antes de confiar nisso na validação/submissão em massa."""
+
+    image_bgr = cv2.imread(str(image_path))
+
+    if image_bgr is None:
+        raise FileNotFoundError(image_path)
+
+    gates = detect_gates(image_bgr)
+    labels = extract_io_labels(image_bgr, gates)
+
+    print(f"Tesseract disponível: {_HAS_TESSERACT}")
+    print(f"Labels encontradas ({len(labels)}):")
+
+    for text, position in sorted(labels, key=lambda item: item[1][1]):
+        print(f"  {text:>4s}  @ ({position[0]:.0f}, {position[1]:.0f})")
+
+    return labels
 
 
 # ==============================================================================
@@ -1158,7 +1389,7 @@ def save_caches():
 # ==============================================================================
 
 def _graph_cache_key(image_path):
-    return f"{Path(image_path).resolve()}|graph-v3"
+    return f"{Path(image_path).resolve()}|graph-v3.1"
 
 
 def get_circuit_extraction(image_path):
